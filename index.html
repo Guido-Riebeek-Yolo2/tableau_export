@@ -3,6 +3,8 @@
 <head>
 <meta charset="utf-8">
 <title>Grid Export</title>
+<!-- Generic by design: this same file runs unmodified on every dashboard.
+     Do not hardcode a report name anywhere below. -->
 
 <!-- Both libraries are served from this same folder. See SETUP.md step 1. -->
 <script src="./tableau.extensions.1.latest.min.js"></script>
@@ -87,12 +89,18 @@ const FALLBACK_LEVEL_NAMES = {};
 // Turn Measure Names / Measure Values into one column per measure.
 const PIVOT_MEASURES = true;
 
-// Preferred left-to-right measure order. Unlisted measures are appended
-// in the order they first appear in the data.
-const MEASURE_ORDER = ["Bet Eur", "Win Eur", "GGR Eur"];
 
-// Round pivoted measures to this many decimals. null = leave untouched.
-const MEASURE_DECIMALS = 2;
+
+// Manual override, only if you need a column order different from what's
+// already in the view. Leave empty (default) — measures then export
+// left-to-right exactly as they appear in the dashboard's Measure Values
+// shelf, however many there are, with no per-report edit needed.
+const MEASURE_ORDER = [];
+
+// Decimal separator used in Tableau's formatted numbers, for reading
+// precision back off them (see decimalsOf below). "." matches every
+// screenshot seen so far; change to "," for an EU-formatted report.
+const DECIMAL_SEPARATOR = ".";
 
 // Field names never exported, on any dashboard.
 const DROP_FIELDS = [];
@@ -127,6 +135,17 @@ const prefixOf = name => {
 const isNone = label => NONE_LABELS.includes(String(label ?? "").trim().toLowerCase());
 const isMeasureNames  = f => /^measure\s*names$/i.test(f || "");
 const isMeasureValues = f => /^measure\s*values$/i.test(f || "");
+
+// Digits after the decimal separator in Tableau's own formatted string,
+// e.g. "132.56" -> 2, "1,070,061" -> 0, "95.1234%" -> 4. Ignores thousands
+// separators, currency symbols and trailing % automatically, since it only
+// looks at what follows DECIMAL_SEPARATOR. Returns null for non-strings.
+function decimalsOf(formatted) {
+  if (typeof formatted !== "string") return null;
+  const parts = formatted.split(DECIMAL_SEPARATOR);
+  if (parts.length < 2) return 0;
+  return parts[parts.length - 1].replace(/[^0-9]/g, "").length;
+}
 
 // The label for a level parameter: its display alias, or the fallback map
 // if the parameter shows a bare number.
@@ -248,6 +267,7 @@ function pivotMeasures(keep, table) {
   const dims = keep.filter(k => k !== nameCol && k !== valCol);
   const groups = new Map();      // insertion order preserves row order
   const seen = [];
+  const decimalsSeen = {};       // measure -> decimal places, for Diagnostics
 
   table.data.forEach(row => {
     const dimVals = dims.map(d => {
@@ -259,14 +279,27 @@ function pivotMeasures(keep, table) {
 
     const mName = row[nameCol.index].formattedValue;
     const cell  = row[valCol.index];
-    let v = typeof cell.nativeValue === "number" ? cell.nativeValue : cell.formattedValue;
-    if (typeof v === "number" && MEASURE_DECIMALS != null) {
-      v = Number(v.toFixed(MEASURE_DECIMALS));
+
+    let v;
+    if (typeof cell.nativeValue === "number") {
+      // Match whatever precision Tableau is already displaying for this
+      // measure — 2dp for a currency field, 0dp for a count, 4dp for an
+      // RTP-style metric — read straight off the formatted string rather
+      // than a fixed number, so it scales to any number of measures.
+      const d = decimalsOf(cell.formattedValue);
+      if (!(mName in decimalsSeen)) decimalsSeen[mName] = d;
+      v = d == null ? cell.nativeValue : Number(cell.nativeValue.toFixed(d));
+    } else {
+      v = cell.formattedValue;
     }
+
     if (!seen.includes(mName)) seen.push(mName);
     groups.get(key).measures[mName] = v;
   });
 
+  // seen is already in the order measures first appear in the view's data —
+  // i.e. the Measure Values shelf order. MEASURE_ORDER only intervenes if
+  // you've explicitly listed something in it.
   const ordered = [
     ...MEASURE_ORDER.filter(m => seen.includes(m)),
     ...seen.filter(m => !MEASURE_ORDER.includes(m))
@@ -275,7 +308,9 @@ function pivotMeasures(keep, table) {
   return {
     header: [...dims.map(d => d.header), ...ordered],
     rows: [...groups.values()].map(g =>
-      [...g.dimVals, ...ordered.map(m => g.measures[m] ?? null)])
+      [...g.dimVals, ...ordered.map(m => g.measures[m] ?? null)]),
+    order: ordered,
+    decimalsSeen
   };
 }
 
@@ -327,6 +362,10 @@ async function run() {
       "\n\nCOLUMNS IN \"" + ws.name + "\"\n" +
       table.columns.map(c => "  [" + c.index + "] " + c.fieldName +
         (map[c.fieldName] ? "  ->  " + (map[c.fieldName].label || "(none)") : "")).join("\n") +
+      (pivoted
+        ? "\n\nMEASURES DETECTED (view order, decimal places read from Tableau)\n" +
+          pivoted.order.map(m => "  " + m + "  ->  " + pivoted.decimalsSeen[m] + " dp").join("\n")
+        : "") +
       "\n\nEXPORTED\n  " + header.join(" | ") +
       "\n  " + rows.length + " rows" + (pivoted ? " (measures pivoted)" : " (not pivoted)"));
 
