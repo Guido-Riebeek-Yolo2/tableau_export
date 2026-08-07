@@ -1,0 +1,28 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest manifest-version="0.1" xmlns="http://www.tableau.com/xml/extension_manifest">
+  <dashboard-extension id="com.yourcompany.fi03.export" extension-version="1.0.0">
+    <default-locale>en_US</default-locale>
+    <name resource-id="name"/>
+    <description>Exports tableau grid to Excel with the selected Grid Level attribute names as column headers.</description>
+    <author name="Reporting Team"
+            email="reporting@yourcompany.com"
+            organization="Your Company"
+            website="https://yourcompany.com"/>
+    <min-api-version>1.10</min-api-version>
+
+    <!-- LOCAL TESTING: point this at your local web server.
+         PRODUCTION: change to your hosted HTTPS URL, e.g.
+         <url>https://reporting.yourcompany.com/tableau-ext/index.html</url> -->
+    <source-location>
+      <url>http://localhost:8765/index.html</url>
+    </source-location>
+
+    <icon>iVBORw0KGgoAAAANSUhEUgAAACAAAAAgCAIAAAD8GO2jAAAAW0lEQVR42mPwq1xOU8QwasGoBUjoPxIYtWDUglELhowF/4kG5PuAQtOJCiJKTCc2Dsg2nYRIJs90fBZgGoTVdIL2kWABXJCgMvItIEMZA+WZYMRaMNouGj4WAAB3K7TZiLSwFgAAAABJRU5ErkJggg==</icon>
+  </dashboard-extension>
+
+  <resources>
+    <resource id="name">
+      <text locale="en_US">Fi.03 Grid Export</text>
+    </resource>
+  </resources>
+</manifest>

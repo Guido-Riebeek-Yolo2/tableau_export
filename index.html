@@ -1,0 +1,367 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Grid Export</title>
+
+<!-- Both libraries are served from this same folder. See SETUP.md step 1. -->
+<script src="./tableau.extensions.1.latest.min.js"></script>
+<script src="./xlsx.full.min.js"></script>
+
+<style>
+  :root {
+    --ink:      #2c3e50;
+    --muted:    #7f8c9a;
+    --line:     #dfe4e8;
+    --accent:   #4e79a7;
+    --accent-d: #3d6088;
+    --err:      #b5453b;
+  }
+  * { box-sizing: border-box; }
+  html, body { height: 100%; }
+  body {
+    margin: 0; padding: 8px;
+    display: flex; flex-direction: column; gap: 6px;
+    font: 13px/1.4 "Benton Sans", "Segoe UI", Tahoma, sans-serif;
+    color: var(--ink); background: transparent;
+  }
+  #go {
+    flex: 1; min-height: 38px; width: 100%;
+    display: flex; flex-direction: column; align-items: center; justify-content: center;
+    gap: 3px; padding: 8px 14px;
+    border: 1px solid var(--accent); border-radius: 3px;
+    background: var(--accent); color: #fff;
+    font: inherit; font-weight: 600; cursor: pointer;
+    transition: background .12s ease;
+  }
+  #go:hover:not(:disabled) { background: var(--accent-d); border-color: var(--accent-d); }
+  #go:disabled { opacity: .55; cursor: default; }
+  #go:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+  #go .sub {
+    font-size: 11px; font-weight: 400; opacity: .85;
+    max-width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  }
+  #status { font-size: 11px; color: var(--muted); text-align: center; min-height: 14px; }
+  #status.error { color: var(--err); }
+  #diagWrap { display: none; font-size: 11px; color: var(--muted); }
+  body.debug #diagWrap { display: block; }
+  pre {
+    background: #f5f6f7; border: 1px solid var(--line); border-radius: 3px;
+    padding: 6px; margin: 4px 0 0; overflow: auto; max-height: 220px; font-size: 11px;
+  }
+  @media (prefers-reduced-motion: reduce) { #go { transition: none; } }
+</style>
+</head>
+<body>
+
+<button id="go" disabled>
+  <span id="label">Download Excel</span>
+  <span class="sub" id="sub">Starting…</span>
+</button>
+<div id="status"></div>
+
+<div id="diagWrap">
+  <details open><summary>Diagnostics</summary><pre id="diag">–</pre></details>
+</div>
+
+<script>
+/* ============================================================
+   CONFIG
+
+   Headers come from each parameter's own display alias, so no
+   number->attribute mapping is stored here. Works unchanged in
+   any workbook, whatever each CASE statement maps to.
+   ============================================================ */
+
+// Matches "Fi.03 Grid Level 1" and "Grid Level 1 Fi.01" alike.
+const LEVEL_PATTERN = /grid\s*level\s*([1-9])/i;
+
+// Parameter labels meaning "no attribute at this level". Case-insensitive.
+// Columns for these levels are omitted from the export.
+const NONE_LABELS = ["", "none", "n/a", "-"];
+
+// Only used if a parameter has NO display alias and returns a bare number.
+// Leave empty unless you hit that; Diagnostics will tell you.
+const FALLBACK_LEVEL_NAMES = {};
+
+// Turn Measure Names / Measure Values into one column per measure.
+const PIVOT_MEASURES = true;
+
+// Preferred left-to-right measure order. Unlisted measures are appended
+// in the order they first appear in the data.
+const MEASURE_ORDER = ["Bet Eur", "Win Eur", "GGR Eur"];
+
+// Round pivoted measures to this many decimals. null = leave untouched.
+const MEASURE_DECIMALS = 2;
+
+// Field names never exported, on any dashboard.
+const DROP_FIELDS = [];
+
+// Filename prefix. "auto" uses the dashboard name.
+const FILE_STEM = "auto";
+
+/* ============================================================ */
+
+const $ = id => document.getElementById(id);
+let dashboard = null, diagText = "";
+
+if (new URLSearchParams(location.search).get("debug") === "1") {
+  document.body.classList.add("debug");
+}
+
+const setStatus = (msg, isError) => {
+  $("status").textContent = msg || "";
+  $("status").className = isError ? "error" : "";
+};
+const setDiag = t => { diagText = t; $("diag").textContent = t; };
+
+const levelOf = name => {
+  const m = LEVEL_PATTERN.exec(name || "");
+  return m ? Number(m[1]) : null;
+};
+// "Fi.03 Grid Level 1" -> "fi.03"   |   "Grid Level 1 Fi.01" -> "fi.01"
+const prefixOf = name => {
+  const m = /([A-Za-z]+\.[A-Za-z0-9.]+)/.exec(name || "");
+  return m ? m[1].toLowerCase() : "";
+};
+const isNone = label => NONE_LABELS.includes(String(label ?? "").trim().toLowerCase());
+const isMeasureNames  = f => /^measure\s*names$/i.test(f || "");
+const isMeasureValues = f => /^measure\s*values$/i.test(f || "");
+
+// The label for a level parameter: its display alias, or the fallback map
+// if the parameter shows a bare number.
+function labelOf(param) {
+  const shown = String(param.currentValue.formattedValue ?? "").trim();
+  if (shown && !/^-?\d+$/.test(shown)) return shown;
+  const n = Number(param.currentValue.nativeValue ?? param.currentValue.value);
+  return FALLBACK_LEVEL_NAMES[n] ?? shown;
+}
+
+/* Pair each grid COLUMN with the parameter driving it.
+   Matching is by level number, preferring a parameter whose name shares the
+   column's prefix. That keeps Fi.01 and Fi.03 apart inside one workbook. */
+function buildHeaderMap(fieldNames, params) {
+  const levelParams = params
+    .map(p => ({ p, level: levelOf(p.name), prefix: prefixOf(p.name) }))
+    .filter(x => x.level);
+
+  const map = {};
+  fieldNames.forEach(fn => {
+    const level = levelOf(fn);
+    if (!level) return;
+    const prefix = prefixOf(fn);
+    const exact = levelParams.find(x => x.level === level && x.prefix === prefix);
+    const loose = levelParams.find(x => x.level === level);
+    const match = exact || loose;
+    if (match) map[fn] = { label: labelOf(match.p), param: match.p.name, exact: !!exact };
+  });
+  return map;
+}
+
+async function columnNamesOf(ws) {
+  try {
+    if (typeof ws.getSummaryColumnsInfoAsync === "function") {
+      return (await ws.getSummaryColumnsInfoAsync()).map(c => c.fieldName);
+    }
+  } catch (e) { /* not introspectable before export */ }
+  return null;
+}
+
+// Pick the sheet holding the grid: most columns matching LEVEL_PATTERN.
+async function pickWorksheet() {
+  const sheets = dashboard.worksheets;
+  if (sheets.length === 1) return sheets[0];
+  let best = null, bestScore = -1;
+  for (const ws of sheets) {
+    const names = await columnNamesOf(ws);
+    const score = names ? names.filter(levelOf).length : 0;
+    if (score > bestScore) { bestScore = score; best = ws; }
+  }
+  return best || sheets[0];
+}
+
+(async function init() {
+  if (typeof tableau === "undefined") {
+    $("sub").textContent = "Library not loaded";
+    setStatus("tableau.extensions.1.latest.min.js is missing from this folder.", true);
+    return;
+  }
+  try {
+    await tableau.extensions.initializeAsync();
+    dashboard = tableau.extensions.dashboardContent.dashboard;
+
+    await refresh();
+
+    const params = await dashboard.getParametersAsync();
+    params.filter(p => levelOf(p.name)).forEach(p => {
+      p.addEventListener(tableau.TableauEventType.ParameterChanged,
+        () => refresh().catch(e => setStatus(e.message, true)));
+    });
+
+    $("go").disabled = false;
+    $("go").onclick = run;
+  } catch (e) {
+    $("sub").textContent = "Not connected";
+    setStatus("Add this to a dashboard in Tableau — it can't run in a plain browser tab.", true);
+  }
+})();
+
+async function refresh() {
+  const params = await dashboard.getParametersAsync();
+  const ws = await pickWorksheet();
+  const names = await columnNamesOf(ws);
+
+  let labels, lines;
+  if (names) {
+    const map = buildHeaderMap(names, params);
+    const entries = names.filter(levelOf).sort((a, b) => levelOf(a) - levelOf(b));
+    labels = entries.map(fn => map[fn]?.label).filter(l => l && !isNone(l));
+    lines = entries.map(fn =>
+      "  L" + levelOf(fn) + "  " + fn +
+      "\n        <- " + (map[fn] ? map[fn].param + (map[fn].exact ? "" : "  (loose match)") : "no parameter") +
+      "\n        = " + (map[fn] ? (isNone(map[fn].label) ? "(none, dropped)" : map[fn].label) : "?"));
+  } else {
+    const lp = params.map(p => ({ p, level: levelOf(p.name) }))
+                     .filter(x => x.level).sort((a, b) => a.level - b.level);
+    labels = lp.map(x => labelOf(x.p)).filter(l => l && !isNone(l));
+    lines = lp.map(x => "  L" + x.level + "  " + x.p.name + " = " + labelOf(x.p));
+  }
+
+  $("sub").textContent = labels.join(" · ") || "No levels selected";
+
+  setDiag(
+    "DASHBOARD\n  " + dashboard.name +
+    "\n\nGRID SHEET\n  " + ws.name +
+    (names ? "" : "  (columns readable only at export time)") +
+    "\n\nLEVEL RESOLUTION\n" + (lines.join("\n") || "  none found — check LEVEL_PATTERN") +
+    "\n\nALL PARAMETERS\n" + params.map(p =>
+      "  " + p.name + " = " + p.currentValue.formattedValue).join("\n")
+  );
+}
+
+// Long -> wide: one column per Measure Names value.
+function pivotMeasures(keep, table) {
+  const nameCol = keep.find(k => isMeasureNames(k.field));
+  const valCol  = keep.find(k => isMeasureValues(k.field));
+  if (!nameCol || !valCol) return null;
+
+  const dims = keep.filter(k => k !== nameCol && k !== valCol);
+  const groups = new Map();      // insertion order preserves row order
+  const seen = [];
+
+  table.data.forEach(row => {
+    const dimVals = dims.map(d => {
+      const c = row[d.index];
+      return typeof c.nativeValue === "number" ? c.nativeValue : c.formattedValue;
+    });
+    const key = dimVals.join("\u0001");
+    if (!groups.has(key)) groups.set(key, { dimVals, measures: {} });
+
+    const mName = row[nameCol.index].formattedValue;
+    const cell  = row[valCol.index];
+    let v = typeof cell.nativeValue === "number" ? cell.nativeValue : cell.formattedValue;
+    if (typeof v === "number" && MEASURE_DECIMALS != null) {
+      v = Number(v.toFixed(MEASURE_DECIMALS));
+    }
+    if (!seen.includes(mName)) seen.push(mName);
+    groups.get(key).measures[mName] = v;
+  });
+
+  const ordered = [
+    ...MEASURE_ORDER.filter(m => seen.includes(m)),
+    ...seen.filter(m => !MEASURE_ORDER.includes(m))
+  ];
+
+  return {
+    header: [...dims.map(d => d.header), ...ordered],
+    rows: [...groups.values()].map(g =>
+      [...g.dimVals, ...ordered.map(m => g.measures[m] ?? null)])
+  };
+}
+
+async function run() {
+  $("go").disabled = true;
+  setStatus("Reading view data…");
+
+  try {
+    const ws = await pickWorksheet();
+    if (!ws) throw new Error("No worksheet found on this dashboard.");
+
+    const reader = await ws.getSummaryDataReaderAsync();
+    let table;
+    try {
+      table = await reader.getAllPagesAsync();
+    } finally {
+      await reader.releaseAsync();   // always release — it holds server resources
+    }
+
+    const params = await dashboard.getParametersAsync();
+    const map = buildHeaderMap(table.columns.map(c => c.fieldName), params);
+
+    const keep = [];
+    table.columns.forEach(c => {
+      if (DROP_FIELDS.includes(c.fieldName)) return;
+      const hit = map[c.fieldName];
+      if (hit) {
+        if (isNone(hit.label)) return;                       // level set to None
+        keep.push({ index: c.index, field: c.fieldName, header: hit.label });
+      } else {
+        keep.push({ index: c.index, field: c.fieldName, header: c.fieldName });
+      }
+    });
+    if (!keep.length) throw new Error("No columns left to export — check Diagnostics.");
+
+    let header, rows;
+    const pivoted = PIVOT_MEASURES ? pivotMeasures(keep, table) : null;
+    if (pivoted) {
+      ({ header, rows } = pivoted);
+    } else {
+      header = keep.map(k => k.header);
+      rows = table.data.map(r => keep.map(k => {
+        const cell = r[k.index];
+        return typeof cell.nativeValue === "number" ? cell.nativeValue : cell.formattedValue;
+      }));
+    }
+
+    setDiag(diagText +
+      "\n\nCOLUMNS IN \"" + ws.name + "\"\n" +
+      table.columns.map(c => "  [" + c.index + "] " + c.fieldName +
+        (map[c.fieldName] ? "  ->  " + (map[c.fieldName].label || "(none)") : "")).join("\n") +
+      "\n\nEXPORTED\n  " + header.join(" | ") +
+      "\n  " + rows.length + " rows" + (pivoted ? " (measures pivoted)" : " (not pivoted)"));
+
+    const stem = (FILE_STEM === "auto" ? dashboard.name : FILE_STEM).replace(/[^\w.-]+/g, "_");
+    const name = stem + "_" + new Date().toISOString().slice(0, 10);
+
+    if (typeof XLSX !== "undefined") {
+      const wb = XLSX.utils.book_new();
+      XLSX.utils.book_append_sheet(wb, XLSX.utils.aoa_to_sheet([header, ...rows]), "Data");
+      XLSX.writeFile(wb, name + ".xlsx");
+    } else {
+      downloadCsv([header, ...rows], name + ".csv");
+    }
+
+    setStatus("Exported " + rows.length.toLocaleString() + " rows.");
+  } catch (e) {
+    setStatus(e.message, true);
+  } finally {
+    $("go").disabled = false;
+  }
+}
+
+function downloadCsv(aoa, filename) {
+  const esc = v => {
+    const s = v == null ? "" : String(v);
+    return /[",\r\n]/.test(s) ? '"' + s.replace(/"/g, '""') + '"' : s;
+  };
+  const blob = new Blob(["\uFEFF" + aoa.map(r => r.map(esc).join(",")).join("\r\n")],
+                        { type: "text/csv;charset=utf-8;" });
+  const a = document.createElement("a");
+  a.href = URL.createObjectURL(blob);
+  a.download = filename;
+  a.click();
+  setTimeout(() => URL.revokeObjectURL(a.href), 1000);
+}
+</script>
+</body>
+</html>
