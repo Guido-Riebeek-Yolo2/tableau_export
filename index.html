@@ -132,19 +132,25 @@ const setStatus = (msg, isError) => {
 };
 const setDiag = t => { diagText = t; $("diag").textContent = t; };
 
+// Collapses any run of whitespace — including the non-breaking spaces
+// Tableau's UI sometimes inserts — into a single normal space. Matching
+// runs against this, so an invisible character difference between a field
+// name and its parameter can't silently break the pairing.
+const norm = s => String(s || "").replace(/[\s\u00A0]+/g, " ").trim();
+
 // Matched slot within one axis: the captured number for Grid Level fields,
 // or "_" for axes like Metric Selector whose pattern has no number group.
 // null means "doesn't belong to this axis at all".
 const slotOf = (name, pattern) => {
-  const m = pattern.exec(name || "");
+  const m = pattern.exec(norm(name));
   return m ? (m[1] || "_") : null;
 };
 const isSelectorField = name => AXES.some(a => slotOf(name, a.pattern) != null);
-const isSortField = name => SORT_FIELD_PATTERN.test(name || "");
+const isSortField = name => SORT_FIELD_PATTERN.test(norm(name));
 
 // "Fi.03 Grid Level 1" -> "fi.03"   |   "SUM(Kp.06 Metric Selector)" -> "kp.06"
 const prefixOf = name => {
-  const m = /([A-Za-z]+\.[A-Za-z0-9.]+)/.exec(name || "");
+  const m = /([A-Za-z]+\.[A-Za-z0-9.]+)/.exec(norm(name));
   return m ? m[1].toLowerCase() : "";
 };
 const isNone = label => NONE_LABELS.includes(String(label ?? "").trim().toLowerCase());
