@@ -75,8 +75,19 @@
    any workbook, whatever each CASE statement maps to.
    ============================================================ */
 
-// Matches "Fi.03 Grid Level 1" and "Grid Level 1 Fi.01" alike.
-const LEVEL_PATTERN = /grid\s*level\s*([1-9])/i;
+// Each entry below is an "axis" of dynamic column: a field whose header
+// should come from a parameter rather than its own name. Grid Level fields
+// pair by number (1-9); Metric Selector fields have no number and pair
+// one-to-one within a prefix, since a report typically has just one.
+// Add a line here for any future selector type using the same convention.
+const AXES = [
+  { name: "gridLevel",      pattern: /grid\s*level\s*([1-9])/i },
+  { name: "metricSelector", pattern: /metric\s*selector\s*([1-9])?/i }
+];
+
+// Fields matching this are pure sort-helpers (e.g. "AGG(Kp.06 Metric Sort)")
+// and are dropped from every export, regardless of value or axis matching.
+const SORT_FIELD_PATTERN = /\bsort\b/i;
 
 // Parameter labels meaning "no attribute at this level". Case-insensitive.
 // Columns for these levels are omitted from the export.
@@ -88,8 +99,6 @@ const FALLBACK_LEVEL_NAMES = {};
 
 // Turn Measure Names / Measure Values into one column per measure.
 const PIVOT_MEASURES = true;
-
-
 
 // Manual override, only if you need a column order different from what's
 // already in the view. Leave empty (default) — measures then export
@@ -123,11 +132,17 @@ const setStatus = (msg, isError) => {
 };
 const setDiag = t => { diagText = t; $("diag").textContent = t; };
 
-const levelOf = name => {
-  const m = LEVEL_PATTERN.exec(name || "");
-  return m ? Number(m[1]) : null;
+// Matched slot within one axis: the captured number for Grid Level fields,
+// or "_" for axes like Metric Selector whose pattern has no number group.
+// null means "doesn't belong to this axis at all".
+const slotOf = (name, pattern) => {
+  const m = pattern.exec(name || "");
+  return m ? (m[1] || "_") : null;
 };
-// "Fi.03 Grid Level 1" -> "fi.03"   |   "Grid Level 1 Fi.01" -> "fi.01"
+const isSelectorField = name => AXES.some(a => slotOf(name, a.pattern) != null);
+const isSortField = name => SORT_FIELD_PATTERN.test(name || "");
+
+// "Fi.03 Grid Level 1" -> "fi.03"   |   "SUM(Kp.06 Metric Selector)" -> "kp.06"
 const prefixOf = name => {
   const m = /([A-Za-z]+\.[A-Za-z0-9.]+)/.exec(name || "");
   return m ? m[1].toLowerCase() : "";
@@ -147,8 +162,8 @@ function decimalsOf(formatted) {
   return parts[parts.length - 1].replace(/[^0-9]/g, "").length;
 }
 
-// The label for a level parameter: its display alias, or the fallback map
-// if the parameter shows a bare number.
+// The label for a selector parameter: its display alias, or the fallback
+// map if the parameter shows a bare number.
 function labelOf(param) {
   const shown = String(param.currentValue.formattedValue ?? "").trim();
   if (shown && !/^-?\d+$/.test(shown)) return shown;
@@ -156,23 +171,29 @@ function labelOf(param) {
   return FALLBACK_LEVEL_NAMES[n] ?? shown;
 }
 
-/* Pair each grid COLUMN with the parameter driving it.
-   Matching is by level number, preferring a parameter whose name shares the
-   column's prefix. That keeps Fi.01 and Fi.03 apart inside one workbook. */
+/* Pair each selector COLUMN (any axis) with the parameter driving it.
+   Matching is by slot, preferring a parameter that shares the column's
+   prefix — that's what keeps Fi.01 / Fi.03 / Kp.06 apart in one workbook,
+   and what lets a Metric Selector column resolve independently of any
+   Grid Level column sitting right next to it. A field that matches no
+   axis (a regular fixed metric, e.g. plain "Bet Eur") is simply absent
+   from the map and keeps its own name at export time. */
 function buildHeaderMap(fieldNames, params) {
-  const levelParams = params
-    .map(p => ({ p, level: levelOf(p.name), prefix: prefixOf(p.name) }))
-    .filter(x => x.level);
-
   const map = {};
-  fieldNames.forEach(fn => {
-    const level = levelOf(fn);
-    if (!level) return;
-    const prefix = prefixOf(fn);
-    const exact = levelParams.find(x => x.level === level && x.prefix === prefix);
-    const loose = levelParams.find(x => x.level === level);
-    const match = exact || loose;
-    if (match) map[fn] = { label: labelOf(match.p), param: match.p.name, exact: !!exact };
+  AXES.forEach(axis => {
+    const axisParams = params
+      .map(p => ({ p, slot: slotOf(p.name, axis.pattern), prefix: prefixOf(p.name) }))
+      .filter(x => x.slot != null);
+
+    fieldNames.forEach(fn => {
+      const slot = slotOf(fn, axis.pattern);
+      if (slot == null) return;
+      const prefix = prefixOf(fn);
+      const exact = axisParams.find(x => x.slot === slot && x.prefix === prefix);
+      const loose = axisParams.find(x => x.slot === slot);
+      const match = exact || loose;
+      if (match) map[fn] = { label: labelOf(match.p), param: match.p.name, exact: !!exact, axis: axis.name };
+    });
   });
   return map;
 }
@@ -186,14 +207,14 @@ async function columnNamesOf(ws) {
   return null;
 }
 
-// Pick the sheet holding the grid: most columns matching LEVEL_PATTERN.
+// Pick the sheet holding the grid: most columns matching any axis pattern.
 async function pickWorksheet() {
   const sheets = dashboard.worksheets;
   if (sheets.length === 1) return sheets[0];
   let best = null, bestScore = -1;
   for (const ws of sheets) {
     const names = await columnNamesOf(ws);
-    const score = names ? names.filter(levelOf).length : 0;
+    const score = names ? names.filter(isSelectorField).length : 0;
     if (score > bestScore) { bestScore = score; best = ws; }
   }
   return best || sheets[0];
@@ -212,7 +233,7 @@ async function pickWorksheet() {
     await refresh();
 
     const params = await dashboard.getParametersAsync();
-    params.filter(p => levelOf(p.name)).forEach(p => {
+    params.filter(p => isSelectorField(p.name)).forEach(p => {
       p.addEventListener(tableau.TableauEventType.ParameterChanged,
         () => refresh().catch(e => setStatus(e.message, true)));
     });
@@ -233,26 +254,29 @@ async function refresh() {
   let labels, lines;
   if (names) {
     const map = buildHeaderMap(names, params);
-    const entries = names.filter(levelOf).sort((a, b) => levelOf(a) - levelOf(b));
+    const entries = names.filter(isSelectorField);
     labels = entries.map(fn => map[fn]?.label).filter(l => l && !isNone(l));
     lines = entries.map(fn =>
-      "  L" + levelOf(fn) + "  " + fn +
+      "  [" + (map[fn]?.axis || "?") + "]  " + fn +
       "\n        <- " + (map[fn] ? map[fn].param + (map[fn].exact ? "" : "  (loose match)") : "no parameter") +
       "\n        = " + (map[fn] ? (isNone(map[fn].label) ? "(none, dropped)" : map[fn].label) : "?"));
+    const sortFields = names.filter(isSortField);
+    if (sortFields.length) {
+      lines.push("\nSORT HELPERS (always dropped)\n" + sortFields.map(f => "  " + f).join("\n"));
+    }
   } else {
-    const lp = params.map(p => ({ p, level: levelOf(p.name) }))
-                     .filter(x => x.level).sort((a, b) => a.level - b.level);
-    labels = lp.map(x => labelOf(x.p)).filter(l => l && !isNone(l));
-    lines = lp.map(x => "  L" + x.level + "  " + x.p.name + " = " + labelOf(x.p));
+    const lp = params.filter(p => isSelectorField(p.name));
+    labels = lp.map(p => labelOf(p)).filter(l => l && !isNone(l));
+    lines = lp.map(p => "  " + p.name + " = " + labelOf(p));
   }
 
-  $("sub").textContent = labels.join(" · ") || "No levels selected";
+  $("sub").textContent = labels.join(" · ") || "No selectors found";
 
   setDiag(
     "DASHBOARD\n  " + dashboard.name +
     "\n\nGRID SHEET\n  " + ws.name +
     (names ? "" : "  (columns readable only at export time)") +
-    "\n\nLEVEL RESOLUTION\n" + (lines.join("\n") || "  none found — check LEVEL_PATTERN") +
+    "\n\nSELECTOR RESOLUTION\n" + (lines.join("\n") || "  none found — check AXES patterns") +
     "\n\nALL PARAMETERS\n" + params.map(p =>
       "  " + p.name + " = " + p.currentValue.formattedValue).join("\n")
   );
@@ -334,8 +358,10 @@ async function run() {
     const map = buildHeaderMap(table.columns.map(c => c.fieldName), params);
 
     const keep = [];
+    const droppedSort = [];
     table.columns.forEach(c => {
       if (DROP_FIELDS.includes(c.fieldName)) return;
+      if (isSortField(c.fieldName)) { droppedSort.push(c.fieldName); return; }
       const hit = map[c.fieldName];
       if (hit) {
         if (isNone(hit.label)) return;                       // level set to None
@@ -361,7 +387,8 @@ async function run() {
     setDiag(diagText +
       "\n\nCOLUMNS IN \"" + ws.name + "\"\n" +
       table.columns.map(c => "  [" + c.index + "] " + c.fieldName +
-        (map[c.fieldName] ? "  ->  " + (map[c.fieldName].label || "(none)") : "")).join("\n") +
+        (isSortField(c.fieldName) ? "  (sort helper, dropped)" :
+         map[c.fieldName] ? "  ->  " + (map[c.fieldName].label || "(none)") : "")).join("\n") +
       (pivoted
         ? "\n\nMEASURES DETECTED (view order, decimal places read from Tableau)\n" +
           pivoted.order.map(m => "  " + m + "  ->  " + pivoted.decimalsSeen[m] + " dp").join("\n")
