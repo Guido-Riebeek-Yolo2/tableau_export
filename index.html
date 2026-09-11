@@ -216,6 +216,11 @@ async function columnNamesOf(ws) {
 // Pick the sheet holding the grid: most columns matching any axis pattern.
 async function pickWorksheet() {
   const sheets = dashboard.worksheets;
+  const forced = tableau.extensions.settings.get("sourceSheet");
+  if (forced) {
+     const ws = sheets.find(w => w.name === forced);
+  if (ws) return ws;              // explicit config wins
+  }
   if (sheets.length === 1) return sheets[0];
   let best = null, bestScore = -1;
   for (const ws of sheets) {
@@ -226,14 +231,75 @@ async function pickWorksheet() {
   return best || sheets[0];
 }
 
+// Enables/disables the button based on whether a mark is selected on the
+// configured "gate" sheet (e.g. the game-release table). No gate configured
+// = always enabled, same as today.
+async function updateGate() {
+  const gateName = tableau.extensions.settings.get("gateSheet");
+  if (!gateName) { $("go").disabled = false; return; }
+  const gateWs = dashboard.worksheets.find(w => w.name === gateName);
+  if (!gateWs) { $("go").disabled = false; return; }
+  const marks = await gateWs.getSelectedMarksAsync();
+  const hasSelection = marks.data.some(t => t.data.length > 0);
+  $("go").disabled = !hasSelection;
+  setStatus(hasSelection ? "" : "Select a game first.");
+}
+
+// Fired by Tableau's "Configure..." menu item (registered in init() below).
+async function openConfigureDialog() {
+  const popupUrl = location.origin + location.pathname + "?configure=1";
+  try {
+    await tableau.extensions.ui.displayDialogAsync(popupUrl, "", { height: 340, width: 480 });
+    await refresh();
+    await updateGate();
+  } catch (e) { /* user cancelled the dialog */ }
+}
+
+// Runs when this same file is loaded inside the config popup (see init()).
+async function runConfigureDialog() {
+  await tableau.extensions.initializeDialogAsync();
+  const names = tableau.extensions.dashboardContent.dashboard.worksheets.map(w => w.name);
+  const opt = (v, l) => `<option value="${v}">${l}</option>`;
+
+  document.body.innerHTML = `
+    <div style="font:13px sans-serif;padding:10px;display:flex;flex-direction:column;gap:10px;">
+      <label>Sheet to export
+        <select id="sheetPick">${opt("", "Auto-detect")}${names.map(n => opt(n, n)).join("")}</select>
+      </label>
+      <label>Require a selection on (optional)
+        <select id="gatePick">${opt("", "— none —")}${names.map(n => opt(n, n)).join("")}</select>
+      </label>
+      <div style="display:flex;gap:8px;justify-content:flex-end;">
+        <button id="cancelBtn">Cancel</button>
+        <button id="saveBtn">Save</button>
+      </div>
+    </div>`;
+
+  $("sheetPick").value = tableau.extensions.settings.get("sourceSheet") || "";
+  $("gatePick").value  = tableau.extensions.settings.get("gateSheet")  || "";
+  $("cancelBtn").onclick = () => tableau.extensions.ui.closeDialog("");
+  $("saveBtn").onclick = async () => {
+    tableau.extensions.settings.set("sourceSheet", $("sheetPick").value);
+    tableau.extensions.settings.set("gateSheet", $("gatePick").value);
+    await tableau.extensions.settings.saveAsync();
+    tableau.extensions.ui.closeDialog("saved");
+  };
+}     
+
 (async function init() {
   if (typeof tableau === "undefined") {
     $("sub").textContent = "Library not loaded";
     setStatus("tableau.extensions.1.latest.min.js is missing from this folder.", true);
     return;
   }
-  try {
-    await tableau.extensions.initializeAsync();
+  // this file also serves as the popup when "Configure..." is clicked
+  if (new URLSearchParams(location.search).get("configure") === "1") {
+    return runConfigureDialog();
+  }
+
+   try {
+    // register the configure callback
+    await tableau.extensions.initializeAsync({ configure: openConfigureDialog });
     dashboard = tableau.extensions.dashboardContent.dashboard;
 
     await refresh();
@@ -244,11 +310,18 @@ async function pickWorksheet() {
         () => refresh().catch(e => setStatus(e.message, true)));
     });
 
-    $("go").disabled = false;
+    const gateSheet = tableau.extensions.settings.get("gateSheet");
+    if (gateSheet) {
+      const gateWs = dashboard.worksheets.find(w => w.name === gateSheet);
+      if (gateWs) gateWs.addEventListener(tableau.TableauEventType.MarkSelectionChanged, updateGate);
+    }
+    await updateGate();
+
     $("go").onclick = run;
   } catch (e) {
     $("sub").textContent = "Not connected";
     setStatus("Add this to a dashboard in Tableau — it can't run in a plain browser tab.", true);
+  }
   }
 })();
 
