@@ -348,7 +348,7 @@ async function refresh() {
     lines = lp.map(p => "  " + p.name + " = " + labelOf(p));
   }
 
-  $("sub").textContent = labels.join(" · ") || "No selectors found";
+  $("sub").textContent = labels.join(" · ") || "";
 
   setDiag(
     "DASHBOARD\n  " + dashboard.name +
