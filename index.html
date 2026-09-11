@@ -242,7 +242,7 @@ async function updateGate() {
   const marks = await gateWs.getSelectedMarksAsync();
   const hasSelection = marks.data.some(t => t.data.length > 0);
   $("go").disabled = !hasSelection;
-  setStatus(hasSelection ? "" : "Select a game first.");
+  setStatus(hasSelection ? "" : "Make a selection first.");
 }
 
 // Fired by Tableau's "Configure..." menu item (registered in init() below).
