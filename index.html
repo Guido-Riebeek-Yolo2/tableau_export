@@ -145,10 +145,11 @@ const FALLBACK_LEVEL_NAMES = {};
 // Turn Measure Names / Measure Values into one column per measure.
 const PIVOT_MEASURES = true;
 
-// Manual override, only if you need a column order different from what's
-// already in the view. Leave empty (default) — measures then export
-// left-to-right exactly as they appear in the dashboard's Measure Values
-// shelf, however many there are, with no per-report edit needed.
+// Manual override, only if you need a column order different from the view.
+// Leave empty (default): measures then export in the order of the sheet's
+// Measure Values shelf, read from Tableau's visual specification. If that
+// can't be read (older Tableau, aliased Measure Names), they fall back to the
+// order the data arrives in, and Diagnostics says so.
 const MEASURE_ORDER = [];
 
 // Decimal separator used in Tableau's formatted numbers, for reading
@@ -161,6 +162,14 @@ const DROP_FIELDS = [];
 
 // Filename prefix. "auto" uses the dashboard name.
 const FILE_STEM = "auto";
+
+// Write date-like columns as real Excel dates (sortable, filterable, usable in
+// formulas) instead of text. Applies to dimension columns whose header names
+// a date grain, and only when EVERY value in the column parses; otherwise the
+// column stays text and Diagnostics says why. The Excel format is chosen to
+// match how Tableau displays the value, so "2026-09" still reads "2026-09".
+const EXCEL_DATES = true;
+const DATE_HEADER_PATTERN = /\b(date|day|week|month|quarter|year)s?\b/i;
 
 // Workbook setting holding per-sheet exclusions chosen in Configure:
 //   { "<sheet name>": { columns: ["Grid Index", ...], measures: ["Avg Bet Eur", ...] } }
@@ -668,7 +677,8 @@ async function readSheetItems(ws, params, paramSetOverride) {
       const m = r[nameCol.index].formattedValue;
       if (!seen.includes(m)) seen.push(m);
     });
-    seen.forEach(m => items.push({ kind: "measures", key: m, label: m }));
+    orderMeasures(seen, await shelfMeasureOrder(ws)).ordered
+      .forEach(m => items.push({ kind: "measures", key: m, label: m }));
   }
   return { items, set: res.set, auto, unresolved: res.unresolved, families: paramFamilies(params) };
 }
@@ -759,8 +769,164 @@ async function refresh() {
   );
 }
 
+// Value for a dimension cell: numbers stay numbers, real date fields keep
+// their Date (Tableau parses them as UTC midnight), everything else is the
+// text Tableau shows.
+function dimValue(cell) {
+  if (typeof cell.nativeValue === "number") return cell.nativeValue;
+  if (isDate(cell.nativeValue)) return cell.nativeValue;
+  return cell.formattedValue;
+}
+
+// Type-tag check rather than instanceof, so a Date created by the Tableau
+// library (possibly another JS realm) is still recognised.
+const isDate = v => Object.prototype.toString.call(v) === "[object Date]" && !isNaN(v);
+
+const MONTHS = ["jan","feb","mar","apr","may","jun","jul","aug","sep","oct","nov","dec"];
+const isBlank = v => v == null || /^(|null|none)$/i.test(String(v).trim());
+
+// Excel serial day number, computed in UTC so no timezone can shift the day.
+const excelSerial = (y, m, d, hh = 0, mi = 0, ss = 0) =>
+  (Date.UTC(y, m - 1, d, hh, mi, ss) - Date.UTC(1899, 11, 30)) / 86400000;
+
+/* One value -> { kind, serial | number, fmt } or { text: reason } if it can't
+   become a date. `kind` must agree across a column for it to convert. */
+function parseDateValue(v) {
+  if (isDate(v)) {
+    const t = [v.getUTCHours(), v.getUTCMinutes(), v.getUTCSeconds()];
+    const timed = t.some(Boolean);
+    return { kind: timed ? "datetime" : "date",
+             serial: excelSerial(v.getUTCFullYear(), v.getUTCMonth() + 1, v.getUTCDate(), ...t),
+             fmt: timed ? "yyyy-mm-dd hh:mm:ss" : "yyyy-mm-dd" };
+  }
+  const s = String(v).trim();
+  let m;
+  const valid = (y, mo, d) => {
+    const dt = new Date(Date.UTC(y, mo - 1, d));
+    return dt.getUTCFullYear() === y && dt.getUTCMonth() === mo - 1 && dt.getUTCDate() === d;
+  };
+  // 2026-10-01, optionally with a time (Tableau's STR() of a date/datetime)
+  if ((m = /^(\d{4})-(\d{2})-(\d{2})(?:[ T](\d{2}):(\d{2})(?::(\d{2}))?)?$/.exec(s))) {
+    const [y, mo, d, hh = 0, mi = 0, ss = 0] = m.slice(1).map(x => Number(x || 0));
+    if (!valid(y, mo, d)) return { text: "\u201C" + s + "\u201D isn't a real calendar date" };
+    const timed = hh || mi || ss;
+    return { kind: timed ? "datetime" : "date", serial: excelSerial(y, mo, d, hh, mi, ss),
+             fmt: timed ? "yyyy-mm-dd hh:mm:ss" : "yyyy-mm-dd" };
+  }
+  // 2026-09  (month)
+  if ((m = /^(\d{4})-(\d{2})$/.exec(s)) && +m[2] >= 1 && +m[2] <= 12) {
+    return { kind: "month", serial: excelSerial(+m[1], +m[2], 1), fmt: "yyyy-mm" };
+  }
+  // Sep 2026 / September 2026  (month)
+  if ((m = /^([A-Za-z]{3,9})\.?[ -](\d{4})$/.exec(s)) && MONTHS.includes(m[1].slice(0, 3).toLowerCase())) {
+    const mo = MONTHS.indexOf(m[1].slice(0, 3).toLowerCase()) + 1;
+    return { kind: "month", serial: excelSerial(+m[2], mo, 1), fmt: m[1].length > 3 ? "mmmm yyyy" : "mmm yyyy" };
+  }
+  // 2026  (year: a plain number is more useful in Excel than a date)
+  if ((m = /^(\d{4})$/.exec(s))) return { kind: "year", number: +m[1], fmt: "0" };
+  if (/q[1-4]/i.test(s)) return { text: "quarters have no Excel date format" };
+  if (/w(ee)?k?\s*\d/i.test(s)) return { text: "week numbers like \u201C" + s + "\u201D have no Excel date format" };
+  return { text: "\u201C" + s + "\u201D isn't a recognised date" };
+}
+
+/* Decide, per column, whether it exports as dates. Only the first
+   `dimCount` columns are candidates (the rest are measures). */
+function detectDateColumns(header, rows, dimCount) {
+  const result = [];
+  if (!EXCEL_DATES) return result;
+  for (let c = 0; c < dimCount; c++) {
+    const nativeDates = rows.some(r => isDate(r[c]));
+    if (!nativeDates && !DATE_HEADER_PATTERN.test(header[c])) continue;
+    let kind = null, fmt = null, reason = null;
+    const parsed = [];
+    for (const r of rows) {
+      const v = r[c];
+      if (isBlank(v) && !isDate(v)) { parsed.push(null); continue; }
+      const p = parseDateValue(v);
+      if (p.text) { reason = p.text; break; }
+      if (kind && p.kind !== kind) { reason = "mixed formats (" + kind + " and " + p.kind + ")"; break; }
+      kind = p.kind;
+      fmt = fmt || p.fmt;
+      parsed.push(p);
+    }
+    if (!kind && !reason) reason = "no values";
+    result.push(reason ? { col: c, header: header[c], reason }
+                       : { col: c, header: header[c], kind, fmt, parsed });
+  }
+  return result;
+}
+
+// Header + rows -> worksheet, with date columns written as typed cells.
+function buildSheet(header, rows, dateCols) {
+  const toText = v => isDate(v) ? v.toISOString().slice(0, 10) : v;
+  const ws = XLSX.utils.aoa_to_sheet([header, ...rows.map(r => r.map(toText))]);
+  const cols = [];
+  dateCols.filter(d => d.kind).forEach(d => {
+    d.parsed.forEach((p, i) => {
+      if (!p) return;
+      const ref = XLSX.utils.encode_cell({ r: i + 1, c: d.col });
+      ws[ref] = p.kind === "year" ? { t: "n", v: p.number, z: "0" } : { t: "n", v: p.serial, z: d.fmt };
+    });
+    // wide enough that Excel shows the date rather than ####
+    cols[d.col] = { wch: Math.max(String(d.header).length, d.fmt.length) + 2 };
+  });
+  if (cols.length) ws["!cols"] = cols;
+  return ws;
+}
+
+// "SUM(Daily Actives)" -> "daily actives", so a shelf field matches its
+// Measure Names value whether or not the aggregation is spelled out.
+const measureKey = s => norm(s).replace(/^[A-Za-z]+\((.*)\)$/, "$1").toLowerCase();
+
+/* The sheet's Measure Values shelf, top to bottom, as field names. Searches
+   the visual specification for encodings of type "measure-values" wherever
+   they sit, preferring the active marks card. Returns { names } or { why }. */
+async function shelfMeasureOrder(ws) {
+  if (typeof ws.getVisualSpecificationAsync !== "function") {
+    return { why: "this Tableau version doesn't expose the shelf order" };
+  }
+  try {
+    const spec = await ws.getVisualSpecificationAsync();
+    const cards = spec?.marksSpecifications || [];
+    const active = cards[spec?.activeMarksSpecificationIndex];
+    const fieldName = f => f && (f.name || f.fieldName || f.caption || f.fieldCaption);
+    const fromEncodings = list => (list || [])
+      .filter(e => /measure.?values/i.test(String(e?.type)))
+      .map(e => fieldName(e.field) || fieldName(e)).filter(Boolean);
+    for (const card of [active, ...cards].filter(Boolean)) {
+      const names = fromEncodings(card.encodings);
+      if (names.length) return { names };
+    }
+    const names = fromEncodings(spec?.encodings);
+    return names.length ? { names } : { why: "no Measure Values shelf in the sheet's specification" };
+  } catch (e) {
+    return { why: "couldn't read the shelf (" + e.message + ")" };
+  }
+}
+
+// Final measure order: MEASURE_ORDER first, then the shelf order when every
+// remaining measure can be found on it, else the order seen in the data.
+function orderMeasures(seen, shelf) {
+  const rest = seen.filter(m => !MEASURE_ORDER.includes(m));
+  let source;
+  if (shelf?.names) {
+    const pos = new Map(shelf.names.map((n, i) => [measureKey(n), i]));
+    const missing = rest.filter(m => !pos.has(measureKey(m)));
+    if (!missing.length) {
+      rest.sort((a, b) => pos.get(measureKey(a)) - pos.get(measureKey(b)));
+      source = "Measure Values shelf";
+    } else {
+      source = "data order (not found on the shelf: " + missing.join(", ") + ")";
+    }
+  } else {
+    source = "data order (" + (shelf?.why || "shelf not read") + ")";
+  }
+  if (MEASURE_ORDER.length) source = "MEASURE_ORDER, then " + source;
+  return { ordered: [...MEASURE_ORDER.filter(m => seen.includes(m)), ...rest], source };
+}
+
 // Long -> wide: one column per Measure Names value.
-function pivotMeasures(keep, table, excludedMeasures = []) {
+function pivotMeasures(keep, table, excludedMeasures = [], shelf = null) {
   const nameCol = keep.find(k => isMeasureNames(k.field));
   const valCol  = keep.find(k => isMeasureValues(k.field));
   if (!nameCol || !valCol) return null;
@@ -777,10 +943,9 @@ function pivotMeasures(keep, table, excludedMeasures = []) {
 
   table.data.forEach(row => {
     const dimVals = dims.map(d => {
-      const c = row[d.index];
-      return typeof c.nativeValue === "number" ? c.nativeValue : c.formattedValue;
+      return dimValue(row[d.index]);
     });
-    const key = dimVals.join("\u0001");
+    const key = dimVals.map(v => isDate(v) ? v.toISOString() : v).join("\u0001");
     if (!groups.has(key)) groups.set(key, { dimVals, measures: {} });
 
     const mName = row[nameCol.index].formattedValue;
@@ -803,19 +968,16 @@ function pivotMeasures(keep, table, excludedMeasures = []) {
     groups.get(key).measures[mName] = v;
   });
 
-  // seen is already in the order measures first appear in the view's data —
-  // i.e. the Measure Values shelf order. MEASURE_ORDER only intervenes if
-  // you've explicitly listed something in it.
-  const ordered = [
-    ...MEASURE_ORDER.filter(m => seen.includes(m)),
-    ...seen.filter(m => !MEASURE_ORDER.includes(m))
-  ].filter(m => !excludedMeasures.includes(m));
+  const order = orderMeasures(seen, shelf);
+  const ordered = order.ordered.filter(m => !excludedMeasures.includes(m));
 
   return {
     header: [...outDims.map(x => x.d.header), ...ordered],
     rows: [...groups.values()].map(g =>
       [...outDims.map(x => g.dimVals[x.i]), ...ordered.map(m => g.measures[m] ?? null)]),
     order: ordered,
+    orderSource: order.source,
+    dimCount: outDims.length,
     droppedMeasures: seen.filter(m => excludedMeasures.includes(m)),
     decimalsSeen
   };
@@ -858,20 +1020,23 @@ async function run() {
     if (!keep.length) throw new Error("No columns left to export — check Diagnostics.");
 
     let header, rows;
-    const pivoted = PIVOT_MEASURES ? pivotMeasures(keep, table, ex.measures) : null;
+    const shelf = PIVOT_MEASURES ? await shelfMeasureOrder(ws) : null;
+    const pivoted = PIVOT_MEASURES ? pivotMeasures(keep, table, ex.measures, shelf) : null;
     if (pivoted) {
       ({ header, rows } = pivoted);
     } else {
       const out = keep.filter(k => !k.excluded);
       header = out.map(k => k.header);
       rows = table.data.map(r => out.map(k => {
-        const cell = r[k.index];
-        return typeof cell.nativeValue === "number" ? cell.nativeValue : cell.formattedValue;
+        return dimValue(r[k.index]);
       }));
     }
     if (!header.length) {
       throw new Error("Every column is excluded for this sheet. Open Configure to include some.");
     }
+    // Pivoted: the leading columns are dimensions. Not pivoted: any column
+    // may be one, and numeric measures simply never parse as dates.
+    const dateCols = detectDateColumns(header, rows, pivoted ? pivoted.dimCount : header.length);
 
     setDiag(diagText +
       "\n\nCOLUMNS IN \"" + ws.name + "\"\n" +
@@ -880,10 +1045,15 @@ async function run() {
          isExcluded(c.fieldName) ? "  (excluded in Configure)" :
          map[c.fieldName] ? "  ->  " + (map[c.fieldName].label || "(none)") : "")).join("\n") +
       (pivoted
-        ? "\n\nMEASURES DETECTED (view order, decimal places read from Tableau)\n" +
+        ? "\n\nMEASURES (order from " + pivoted.orderSource + "; decimals read from Tableau)\n" +
           pivoted.order.map(m => "  " + m + "  ->  " + pivoted.decimalsSeen[m] + " dp").join("\n") +
           (pivoted.droppedMeasures.length
             ? "\n  excluded in Configure: " + pivoted.droppedMeasures.join(", ") : "")
+        : "") +
+      (dateCols.length
+        ? "\n\nDATE COLUMNS\n" + dateCols.map(d => "  " + d.header + "  ->  " +
+            (d.kind ? "Excel " + (d.kind === "year" ? "number" : "date") + " (" + d.fmt + ")"
+                    : "left as text: " + d.reason)).join("\n")
         : "") +
       "\n\nEXPORTED\n  " + header.join(" | ") +
       "\n  " + rows.length + " rows" + (pivoted ? " (measures pivoted)" : " (not pivoted)"));
@@ -893,10 +1063,10 @@ async function run() {
 
     if (typeof XLSX !== "undefined") {
       const wb = XLSX.utils.book_new();
-      XLSX.utils.book_append_sheet(wb, XLSX.utils.aoa_to_sheet([header, ...rows]), "Data");
+      XLSX.utils.book_append_sheet(wb, buildSheet(header, rows, dateCols), "Data");
       XLSX.writeFile(wb, name + ".xlsx");
     } else {
-      downloadCsv([header, ...rows], name + ".csv");
+      downloadCsv([header, ...rows.map(r => r.map(v => isDate(v) ? v.toISOString().slice(0, 10) : v))], name + ".csv");
     }
 
     setStatus("Exported " + rows.length.toLocaleString() + " rows.");
