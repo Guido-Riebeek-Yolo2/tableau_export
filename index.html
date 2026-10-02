@@ -82,6 +82,11 @@
   .item .detail { margin-left: auto; padding-left: 8px; color: var(--muted); font-size: 11px; white-space: nowrap; }
   .list .msg { padding: 10px; color: var(--muted); }
   .list .msg.error { color: var(--err); }
+  .warn {
+    padding: 7px 10px; font-size: 12px; color: var(--err);
+    background: #fbf1f0; border: 1px solid #f0d4d1; border-radius: 3px;
+  }
+  .warn[hidden] { display: none; }
   .hint { margin: 0; font-size: 11px; color: var(--muted); }
   .actions { display: flex; gap: 8px; justify-content: flex-end; align-items: center; }
   .btn {
@@ -164,6 +169,12 @@ const FILE_STEM = "auto";
 // are stored, so a pill added to the sheet later exports by default.
 const EXCLUDE_KEY = "excludeBySheet";
 
+// Workbook setting: which parameter set (report prefix) drives each sheet's
+// Grid Level / Metric Selector columns, chosen in Configure.
+//   { "<sheet name>": "kp.03" }      absent or "" = work it out automatically
+// Lets grid fields keep clean names ("Grid Level 1") in the view's headers.
+const PARAM_SET_KEY = "paramSetBySheet";
+
 // Rows read by the Configure dialog to discover a sheet's measures. One page
 // is enough: every row group carries every measure in the Measure Values shelf.
 const CONFIG_SAMPLE_ROWS = 2000;
@@ -239,14 +250,68 @@ function labelOf(param) {
   return FALLBACK_LEVEL_NAMES[n] ?? shown;
 }
 
+function readParamSets() {
+  try {
+    const all = JSON.parse(tableau.extensions.settings.get(PARAM_SET_KEY) || "{}");
+    return all && typeof all === "object" ? all : {};
+  } catch (e) { return {}; }
+}
+
+// Report prefixes that own at least one selector parameter, lower-case key ->
+// display form, e.g. "kp.03" -> "Kp.03". These are the parameter sets a
+// sheet's grid columns can be driven by.
+function paramFamilies(params) {
+  const fam = new Map();
+  params.forEach(p => {
+    if (!isSelectorField(p.name)) return;
+    const m = /([A-Za-z]+\.[A-Za-z0-9.]+)/.exec(norm(p.name));
+    if (m && !fam.has(m[1].toLowerCase())) fam.set(m[1].toLowerCase(), m[1]);
+  });
+  return fam;
+}
+
+/* Which parameter set drives this sheet, for grid fields that carry no prefix
+   of their own (e.g. plain "Grid Level 1", named that so the view's row
+   headers read cleanly). In order of trust:
+     1. the choice saved for this sheet in Configure
+     2. the prefix of the sheet's other fields, when they all agree
+        (e.g. "Kp.03 Title" on Detail)
+     3. the sheet name, then the dashboard name ("Kp.03 Daily KPIs")
+   If none of those settles it, prefix is "" and nothing is guessed.
+   `override` (used by the Configure dialog) replaces the saved choice;
+   pass "" to see what automatic detection would pick. */
+function resolveParamSet(sheetName, fieldNames, params, override) {
+  const fam = paramFamilies(params);
+  const shown = p => fam.get(p) || p;
+  const manual = override !== undefined ? override : (readParamSets()[sheetName] || "");
+  if (manual && fam.has(manual)) return { prefix: manual, display: shown(manual), source: "set in Configure" };
+
+  const byPrefix = new Map();               // prefix -> first field carrying it
+  fieldNames.forEach(f => {
+    const p = prefixOf(f);
+    if (fam.has(p) && !byPrefix.has(p)) byPrefix.set(p, f);
+  });
+  if (byPrefix.size === 1) {
+    const [[p, f]] = byPrefix;
+    return { prefix: p, display: shown(p), source: "from field \u201C" + f + "\u201D" };
+  }
+  for (const [where, name] of [["sheet name", sheetName], ["dashboard name", dashboard?.name]]) {
+    const p = prefixOf(name);
+    if (fam.has(p)) return { prefix: p, display: shown(p), source: "from the " + where };
+  }
+  return { prefix: "", display: "", source: "",
+           candidates: [...(byPrefix.size ? byPrefix.keys() : fam.keys())].map(shown) };
+}
+
 /* Pair each selector COLUMN (any axis) with the parameter driving it.
-   Matching is by slot, preferring a parameter that shares the column's
-   prefix — that's what keeps Fi.01 / Fi.03 / Kp.06 apart in one workbook,
-   and what lets a Metric Selector column resolve independently of any
-   Grid Level column sitting right next to it. A field that matches no
-   axis (a regular fixed metric, e.g. plain "Bet Eur") is simply absent
-   from the map and keeps its own name at export time. */
-function buildHeaderMap(fieldNames, params) {
+   Matching is by slot plus prefix: the column's own prefix if it has one
+   ("Kp.06 Grid Level 1"), else the sheet's resolved parameter set. That's
+   what keeps Kp.03 / Kp.04 / Kp.06 apart in one workbook. If neither gives
+   an exact match, a parameter is used only when it's the ONLY one for that
+   slot; otherwise the column stays unpaired (keeps its own name) rather
+   than borrowing another report's labels. A field that matches no axis (a
+   regular metric, e.g. plain "Bet Eur") is absent from the map too. */
+function buildHeaderMap(fieldNames, params, sheetPrefix = "") {
   const map = {};
   AXES.forEach(axis => {
     const axisParams = params
@@ -256,15 +321,32 @@ function buildHeaderMap(fieldNames, params) {
     fieldNames.forEach(fn => {
       const slot = slotOf(fn, axis.pattern);
       if (slot == null) return;
-      const prefix = prefixOf(fn);
-      const exact = axisParams.find(x => x.slot === slot && x.prefix === prefix);
-      const loose = axisParams.find(x => x.slot === slot);
-      const match = exact || loose;
-      if (match) map[fn] = { label: labelOf(match.p), param: match.p.name, exact: !!exact, axis: axis.name };
+      const own = prefixOf(fn);
+      const prefix = own || sheetPrefix;
+      const exact = prefix ? axisParams.find(x => x.slot === slot && x.prefix === prefix) : null;
+      const sameSlot = axisParams.filter(x => x.slot === slot);
+      const match = exact || (sameSlot.length === 1 ? sameSlot[0] : null);
+      if (match) map[fn] = {
+        label: labelOf(match.p), param: match.p.name, axis: axis.name,
+        exact: !!exact, inferred: !!exact && !own
+      };
     });
   });
   return map;
 }
+
+// Everything the export needs to name a sheet's columns, in one call.
+function resolveHeaders(sheetName, fieldNames, params, override) {
+  const set = resolveParamSet(sheetName, fieldNames, params, override);
+  const map = buildHeaderMap(fieldNames, params, set.prefix);
+  const unresolved = fieldNames.filter(f => isSelectorField(f) && !map[f]);
+  return { map, set, unresolved };
+}
+
+const describeSet = set => set.prefix
+  ? set.display + " (" + set.source + ")"
+  : "unclear" + (set.candidates?.length ? " between " + set.candidates.join(", ") : "") +
+    ". Pick one in Configure.";
 
 async function columnNamesOf(ws) {
   try {
@@ -312,7 +394,7 @@ async function updateGate() {
 async function openConfigureDialog() {
   const popupUrl = location.origin + location.pathname + "?configure=1";
   try {
-    await tableau.extensions.ui.displayDialogAsync(popupUrl, "", { height: 620, width: 520 });
+    await tableau.extensions.ui.displayDialogAsync(popupUrl, "", { height: 680, width: 540 });
     await refresh();
     await updateGate();
   } catch (e) { /* user cancelled the dialog */ }
@@ -324,6 +406,9 @@ async function runConfigureDialog() {
   dashboard = tableau.extensions.dashboardContent.dashboard;
   const names = dashboard.worksheets.map(w => w.name);
   const saved = readExcludes();
+  const savedSets = readParamSets();
+  const draftSet = {};       // sheet -> parameter set chosen here ("" = automatic)
+  const setFor = sheet => sheet in draftSet ? draftSet[sheet] : (savedSets[sheet] || "");
 
   // Unsaved edits, per sheet, so switching the dropdown back and forth
   // doesn't lose ticks. Starts from what's saved for each sheet.
@@ -339,6 +424,9 @@ async function runConfigureDialog() {
       <label class="field">Sheet to export
         <select id="sheetPick"></select>
       </label>
+      <label class="field">Parameter set for this sheet
+        <select id="setPick"></select>
+      </label>
       <label class="field">Require a selection on (optional)
         <select id="gatePick"></select>
       </label>
@@ -347,6 +435,7 @@ async function runConfigureDialog() {
           <strong id="colsTitle">Columns</strong>
           <span class="count" id="colsCount"></span>
         </div>
+        <div class="warn" id="setWarn" role="alert" hidden></div>
         <div class="list" id="colList"></div>
         <p class="hint">Unticked columns are left out of the export for this sheet only.
           Fields you add to the sheet later are included automatically.</p>
@@ -367,6 +456,7 @@ async function runConfigureDialog() {
   $("gatePick").value  = tableau.extensions.settings.get("gateSheet")  || "";
 
   let current = null;        // { sheet, items } currently shown
+  let shownSheet = null;     // sheet whose parameter set the dropdown shows
   let loadToken = 0;         // ignores slow loads after the dropdown changed
 
   const message = (text, isError) => {
@@ -454,8 +544,10 @@ async function runConfigureDialog() {
       const ws = await pickWorksheet(choice);
       if (!ws) throw new Error("No worksheet found on this dashboard.");
       const params = await dashboard.getParametersAsync();
-      const items = await readSheetItems(ws, params);
-      if (token === loadToken) render(ws.name, items, !choice);
+      const info = await readSheetItems(ws, params, setFor(ws.name));
+      if (token !== loadToken) return;
+      showParamSet(ws.name, info);
+      render(ws.name, info.items, !choice);
     } catch (e) {
       if (token === loadToken) {
         $("colList").replaceChildren(message("Couldn't read this sheet's columns: " + e.message, true));
@@ -463,7 +555,32 @@ async function runConfigureDialog() {
     }
   }
 
+  function showParamSet(sheet, info) {
+    shownSheet = sheet;
+    const sel = $("setPick");
+    sel.replaceChildren();
+    sel.add(new Option(info.auto.prefix
+      ? "Automatic: " + info.auto.display + " (" + info.auto.source + ")"
+      : "Automatic: couldn't tell", ""));
+    info.families.forEach((display, key) => sel.add(new Option(display, key)));
+    sel.value = info.families.has(setFor(sheet)) ? setFor(sheet) : "";
+
+    const warn = $("setWarn");
+    if (info.unresolved.length) {
+      warn.textContent = "Can't tell which parameters drive " + info.unresolved.join(", ") +
+        ", so they'd export under their field names. Pick a parameter set above.";
+      warn.hidden = false;
+    } else {
+      warn.hidden = true;
+    }
+  }
+
   $("sheetPick").onchange = load;
+  $("setPick").onchange = () => {
+    if (shownSheet == null) return;
+    draftSet[shownSheet] = $("setPick").value;
+    load();
+  };
   $("allBtn").onclick = () => {
     if (!current) return;
     const d = draftFor(current.sheet);
@@ -484,6 +601,9 @@ async function runConfigureDialog() {
       tableau.extensions.settings.set("sourceSheet", $("sheetPick").value);
       tableau.extensions.settings.set("gateSheet", $("gatePick").value);
       tableau.extensions.settings.set(EXCLUDE_KEY, JSON.stringify(all));
+      const sets = readParamSets();
+      Object.entries(draftSet).forEach(([sheet, v]) => { if (v) sets[sheet] = v; else delete sets[sheet]; });
+      tableau.extensions.settings.set(PARAM_SET_KEY, JSON.stringify(sets));
       await tableau.extensions.settings.saveAsync();
       tableau.extensions.ui.closeDialog("saved");
     } catch (e) {
@@ -498,7 +618,7 @@ async function runConfigureDialog() {
 // What the Configure checklist offers for one sheet: each column (with the
 // header it currently exports under) plus, when measures are pivoted, each
 // individual measure from Measure Values. Reads a single page of data.
-async function readSheetItems(ws, params) {
+async function readSheetItems(ws, params, paramSetOverride) {
   const reader = await ws.getSummaryDataReaderAsync(CONFIG_SAMPLE_ROWS);
   let columns, rows = [];
   try {
@@ -515,7 +635,10 @@ async function readSheetItems(ws, params) {
       ? await ws.getSummaryColumnsInfoAsync() : [];
   }
 
-  const map = buildHeaderMap(columns.map(c => c.fieldName), params);
+  const fieldNames = columns.map(c => c.fieldName);
+  const res = resolveHeaders(ws.name, fieldNames, params, paramSetOverride);
+  const auto = resolveParamSet(ws.name, fieldNames, params, "");
+  const map = res.map;
   const nameCol = columns.find(c => isMeasureNames(c.fieldName));
   const pivoting = PIVOT_MEASURES && nameCol && columns.some(c => isMeasureValues(c.fieldName));
   const items = [];
@@ -534,6 +657,7 @@ async function readSheetItems(ws, params) {
       const noneNow = !!hit && isNone(hit.label);
       let detail = "";
       if (hit) detail = noneNow ? "level set to None" : "exports as \u201C" + hit.label + "\u201D";
+      else if (isSelectorField(f)) detail = "no matching parameter";
       items.push({ kind: "columns", key: f, label: f, detail, noneNow });
     }
   });
@@ -546,7 +670,7 @@ async function readSheetItems(ws, params) {
     });
     seen.forEach(m => items.push({ kind: "measures", key: m, label: m }));
   }
-  return items;
+  return { items, set: res.set, auto, unresolved: res.unresolved, families: paramFamilies(params) };
 }
 
 (async function init() {
@@ -593,15 +717,19 @@ async function refresh() {
   const names = await columnNamesOf(ws);
 
   const ex = excludesFor(ws.name);
-  let labels, lines;
+  let labels, lines, setLine = "";
   if (names) {
-    const map = buildHeaderMap(names, params);
+    const res = resolveHeaders(ws.name, names, params);
+    const map = res.map;
+    setLine = "\n\nPARAMETER SET\n  " + describeSet(res.set);
     const entries = names.filter(isSelectorField);
     labels = entries.filter(fn => !ex.columns.includes(fn))
       .map(fn => map[fn]?.label).filter(l => l && !isNone(l));
     lines = entries.map(fn =>
       "  [" + (map[fn]?.axis || "?") + "]  " + fn +
-      "\n        <- " + (map[fn] ? map[fn].param + (map[fn].exact ? "" : "  (loose match)") : "no parameter") +
+      "\n        <- " + (map[fn] ? map[fn].param +
+        (map[fn].inferred ? "  (via parameter set)" : map[fn].exact ? "" : "  (only candidate)")
+        : "no parameter, header stays as field name") +
       "\n        = " + (map[fn] ? (isNone(map[fn].label) ? "(none, dropped)" : map[fn].label) : "?") +
       (ex.columns.includes(fn) ? "  (excluded in Configure)" : ""));
     const sortFields = names.filter(isSortField);
@@ -619,7 +747,7 @@ async function refresh() {
   setDiag(
     "DASHBOARD\n  " + dashboard.name +
     "\n\nGRID SHEET\n  " + ws.name +
-    (names ? "" : "  (columns readable only at export time)") +
+    (names ? "" : "  (columns readable only at export time)") + setLine +
     "\n\nSELECTOR RESOLUTION\n" + (lines.join("\n") || "  none found — check AXES patterns") +
     "\n\nEXCLUDED IN CONFIGURE\n" +
       (ex.columns.length || ex.measures.length
@@ -710,7 +838,7 @@ async function run() {
     }
 
     const params = await dashboard.getParametersAsync();
-    const map = buildHeaderMap(table.columns.map(c => c.fieldName), params);
+    const { map } = resolveHeaders(ws.name, table.columns.map(c => c.fieldName), params);
     const ex = excludesFor(ws.name);
     const isExcluded = f => ex.columns.includes(f) && !isMeasureNames(f) && !isMeasureValues(f);
 
