@@ -190,6 +190,10 @@ const CONFIG_SAMPLE_ROWS = 2000;
 
 /* ============================================================ */
 
+// Shown in Configure and Diagnostics, so it's obvious which version Tableau
+// actually loaded (GitHub Pages and Tableau both cache). Bump on every deploy.
+const BUILD = "2026-10-02.5";
+
 const $ = id => document.getElementById(id);
 let dashboard = null, diagText = "";
 
@@ -446,11 +450,13 @@ async function runConfigureDialog() {
         </div>
         <div class="warn" id="setWarn" role="alert" hidden></div>
         <div class="list" id="colList"></div>
+        <p class="hint" id="orderNote"></p>
         <p class="hint">Unticked columns are left out of the export for this sheet only.
           Fields you add to the sheet later are included automatically.</p>
       </section>
       <div class="actions">
         <button class="btn quiet" id="allBtn" type="button">Include all</button>
+        <span class="hint" id="buildNote"></span>
         <button class="btn" id="cancelBtn" type="button">Cancel</button>
         <button class="btn primary" id="saveBtn" type="button">Save</button>
       </div>
@@ -459,6 +465,7 @@ async function runConfigureDialog() {
   const fill = (sel, first, values) => {
     [first, ...values.map(n => [n, n])].forEach(([v, l]) => sel.add(new Option(l, v)));
   };
+  $("buildNote").textContent = "Build " + BUILD;
   fill($("sheetPick"), ["", "Auto-detect"], names);
   fill($("gatePick"),  ["", "None"], names);
   $("sheetPick").value = tableau.extensions.settings.get("sourceSheet") || "";
@@ -556,6 +563,7 @@ async function runConfigureDialog() {
       const info = await readSheetItems(ws, params, setFor(ws.name));
       if (token !== loadToken) return;
       showParamSet(ws.name, info);
+      $("orderNote").textContent = info.orderSource ? "Measure order: " + info.orderSource : "";
       render(ws.name, info.items, !choice);
     } catch (e) {
       if (token === loadToken) {
@@ -651,6 +659,7 @@ async function readSheetItems(ws, params, paramSetOverride) {
   const nameCol = columns.find(c => isMeasureNames(c.fieldName));
   const pivoting = PIVOT_MEASURES && nameCol && columns.some(c => isMeasureValues(c.fieldName));
   const items = [];
+  let orderSource = "";
 
   columns.forEach(c => {
     const f = c.fieldName;
@@ -677,10 +686,11 @@ async function readSheetItems(ws, params, paramSetOverride) {
       const m = r[nameCol.index].formattedValue;
       if (!seen.includes(m)) seen.push(m);
     });
-    orderMeasures(seen, await shelfMeasureOrder(ws)).ordered
-      .forEach(m => items.push({ kind: "measures", key: m, label: m }));
+    const order = orderMeasures(seen, await shelfMeasureOrder(ws));
+    orderSource = order.source;
+    order.ordered.forEach(m => items.push({ kind: "measures", key: m, label: m }));
   }
-  return { items, set: res.set, auto, unresolved: res.unresolved, families: paramFamilies(params) };
+  return { items, orderSource, set: res.set, auto, unresolved: res.unresolved, families: paramFamilies(params) };
 }
 
 (async function init() {
@@ -702,9 +712,15 @@ async function readSheetItems(ws, params, paramSetOverride) {
     await refresh();
 
     const params = await dashboard.getParametersAsync();
+    // One user change can fire several events; coalesce them into one refresh.
+    let pending = null;
+    const onParamChange = () => {
+      clearTimeout(pending);
+      pending = setTimeout(() =>
+        refresh({ reuseSheet: true }).catch(e => setStatus(e.message, true)), 150);
+    };
     params.filter(p => isSelectorField(p.name)).forEach(p => {
-      p.addEventListener(tableau.TableauEventType.ParameterChanged,
-        () => refresh().catch(e => setStatus(e.message, true)));
+      p.addEventListener(tableau.TableauEventType.ParameterChanged, onParamChange);
     });
 
     const gateSheet = tableau.extensions.settings.get("gateSheet");
@@ -721,10 +737,23 @@ async function readSheetItems(ws, params, paramSetOverride) {
   }
 })();
 
-async function refresh() {
+// Sheet + column names from the last full refresh. A parameter change only
+// alters header LABELS (read from the parameters), never which columns
+// exist, so it reuses these instead of asking Tableau for summary data while
+// it's mid-recalculation, which is what raised Tableau's
+// "bad value: visual-id-pres-model" popup.
+let sheetCache = null;
+
+async function refresh({ reuseSheet = false } = {}) {
   const params = await dashboard.getParametersAsync();
-  const ws = await pickWorksheet();
-  const names = await columnNamesOf(ws);
+  let ws, names;
+  if (reuseSheet && sheetCache) {
+    ({ ws, names } = sheetCache);
+  } else {
+    ws = await pickWorksheet();
+    names = await columnNamesOf(ws);
+    sheetCache = { ws, names };
+  }
 
   const ex = excludesFor(ws.name);
   let labels, lines, setLine = "";
@@ -755,7 +784,8 @@ async function refresh() {
   $("sub").textContent = labels.join(" · ") || "";
 
   setDiag(
-    "DASHBOARD\n  " + dashboard.name +
+    "BUILD\n  " + BUILD +
+    "\n\nDASHBOARD\n  " + dashboard.name +
     "\n\nGRID SHEET\n  " + ws.name +
     (names ? "" : "  (columns readable only at export time)") + setLine +
     "\n\nSELECTOR RESOLUTION\n" + (lines.join("\n") || "  none found — check AXES patterns") +
@@ -898,7 +928,12 @@ async function shelfMeasureOrder(ws) {
       if (names.length) return { names };
     }
     const names = fromEncodings(spec?.encodings);
-    return names.length ? { names } : { why: "no Measure Values shelf in the sheet's specification" };
+    if (names.length) return { names };
+    // Nothing found: describe what Tableau DID return, so the reader can be fixed.
+    const types = [...new Set(cards.flatMap(c => (c.encodings || []).map(e => String(e?.type))))];
+    return { why: "no Measure Values shelf in the sheet's specification; it has keys [" +
+      Object.keys(spec || {}).join(", ") + "], " + cards.length + " marks card(s), encoding types [" +
+      types.join(", ") + "]" };
   } catch (e) {
     return { why: "couldn't read the shelf (" + e.message + ")" };
   }
