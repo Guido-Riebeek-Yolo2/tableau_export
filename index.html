@@ -52,6 +52,46 @@
     padding: 6px; margin: 4px 0 0; overflow: auto; max-height: 220px; font-size: 11px;
   }
   @media (prefers-reduced-motion: reduce) { #go { transition: none; } }
+
+  /* ---------- Configure dialog ---------- */
+  body.cfg-body { padding: 0; background: #fff; }
+  .cfg { height: 100%; display: flex; flex-direction: column; gap: 12px; padding: 14px 16px; }
+  .cfg .field { display: flex; flex-direction: column; gap: 4px; font-weight: 600; }
+  .cfg select {
+    font: inherit; font-weight: 400; color: var(--ink);
+    padding: 5px 6px; border: 1px solid var(--line); border-radius: 3px; background: #fff;
+  }
+  .cols { flex: 1; min-height: 0; display: flex; flex-direction: column; gap: 6px; }
+  .cols-head { display: flex; align-items: baseline; justify-content: space-between; gap: 8px; }
+  .cols-head strong { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .count { color: var(--muted); font-size: 12px; white-space: nowrap; }
+  .list { flex: 1; min-height: 0; overflow: auto; border: 1px solid var(--line); border-radius: 3px; }
+  .group {
+    position: sticky; top: 0; padding: 5px 10px; font-size: 11px; color: var(--muted);
+    background: #f5f6f7; border-bottom: 1px solid var(--line);
+  }
+  .item {
+    display: flex; align-items: center; gap: 8px; padding: 5px 10px;
+    border-bottom: 1px solid #f0f2f4; cursor: pointer;
+  }
+  .item:hover { background: #f8f9fa; }
+  .item input { margin: 0; accent-color: var(--accent); }
+  .item .name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .item.off .name { color: var(--muted); text-decoration: line-through; }
+  .item.locked { cursor: default; color: var(--muted); }
+  .item .detail { margin-left: auto; padding-left: 8px; color: var(--muted); font-size: 11px; white-space: nowrap; }
+  .list .msg { padding: 10px; color: var(--muted); }
+  .list .msg.error { color: var(--err); }
+  .hint { margin: 0; font-size: 11px; color: var(--muted); }
+  .actions { display: flex; gap: 8px; justify-content: flex-end; align-items: center; }
+  .btn {
+    font: inherit; padding: 6px 14px; cursor: pointer;
+    border: 1px solid var(--line); border-radius: 3px; background: #fff; color: var(--ink);
+  }
+  .btn.primary { background: var(--accent); border-color: var(--accent); color: #fff; font-weight: 600; }
+  .btn.primary:hover { background: var(--accent-d); border-color: var(--accent-d); }
+  .btn.quiet { margin-right: auto; border-color: transparent; color: var(--accent); padding-left: 0; }
+  .btn:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
 </style>
 </head>
 <body>
@@ -117,6 +157,17 @@ const DROP_FIELDS = [];
 // Filename prefix. "auto" uses the dashboard name.
 const FILE_STEM = "auto";
 
+// Workbook setting holding per-sheet exclusions chosen in Configure:
+//   { "<sheet name>": { columns: ["Grid Index", ...], measures: ["Avg Bet Eur", ...] } }
+// Columns are keyed by field name (stable even when a Grid Level parameter
+// changes its label); measures by their Measure Names value. Only exclusions
+// are stored, so a pill added to the sheet later exports by default.
+const EXCLUDE_KEY = "excludeBySheet";
+
+// Rows read by the Configure dialog to discover a sheet's measures. One page
+// is enough: every row group carries every measure in the Measure Values shelf.
+const CONFIG_SAMPLE_ROWS = 2000;
+
 /* ============================================================ */
 
 const $ = id => document.getElementById(id);
@@ -156,6 +207,17 @@ const prefixOf = name => {
 const isNone = label => NONE_LABELS.includes(String(label ?? "").trim().toLowerCase());
 const isMeasureNames  = f => /^measure\s*names$/i.test(f || "");
 const isMeasureValues = f => /^measure\s*values$/i.test(f || "");
+
+function readExcludes() {
+  try {
+    const all = JSON.parse(tableau.extensions.settings.get(EXCLUDE_KEY) || "{}");
+    return all && typeof all === "object" ? all : {};
+  } catch (e) { return {}; }
+}
+function excludesFor(sheetName) {
+  const e = readExcludes()[sheetName] || {};
+  return { columns: e.columns || [], measures: e.measures || [] };
+}
 
 // Digits after the decimal separator in Tableau's own formatted string,
 // e.g. "132.56" -> 2, "1,070,061" -> 0, "95.1234%" -> 4. Ignores thousands
@@ -214,12 +276,13 @@ async function columnNamesOf(ws) {
 }
 
 // Pick the sheet holding the grid: most columns matching any axis pattern.
-async function pickWorksheet() {
+// `forced` defaults to the saved choice; the Configure dialog passes the
+// dropdown's current value instead ("" = auto-detect).
+async function pickWorksheet(forced = tableau.extensions.settings.get("sourceSheet")) {
   const sheets = dashboard.worksheets;
-  const forced = tableau.extensions.settings.get("sourceSheet");
   if (forced) {
-     const ws = sheets.find(w => w.name === forced);
-  if (ws) return ws;              // explicit config wins
+    const ws = sheets.find(w => w.name === forced);
+    if (ws) return ws;              // explicit config wins
   }
   if (sheets.length === 1) return sheets[0];
   let best = null, bestScore = -1;
@@ -249,7 +312,7 @@ async function updateGate() {
 async function openConfigureDialog() {
   const popupUrl = location.origin + location.pathname + "?configure=1";
   try {
-    await tableau.extensions.ui.displayDialogAsync(popupUrl, "", { height: 340, width: 480 });
+    await tableau.extensions.ui.displayDialogAsync(popupUrl, "", { height: 620, width: 520 });
     await refresh();
     await updateGate();
   } catch (e) { /* user cancelled the dialog */ }
@@ -258,33 +321,233 @@ async function openConfigureDialog() {
 // Runs when this same file is loaded inside the config popup (see init()).
 async function runConfigureDialog() {
   await tableau.extensions.initializeDialogAsync();
-  const names = tableau.extensions.dashboardContent.dashboard.worksheets.map(w => w.name);
-  const opt = (v, l) => `<option value="${v}">${l}</option>`;
+  dashboard = tableau.extensions.dashboardContent.dashboard;
+  const names = dashboard.worksheets.map(w => w.name);
+  const saved = readExcludes();
 
+  // Unsaved edits, per sheet, so switching the dropdown back and forth
+  // doesn't lose ticks. Starts from what's saved for each sheet.
+  const draft = {};
+  const draftFor = sheet => draft[sheet] || (draft[sheet] = {
+    columns:  new Set(saved[sheet]?.columns  || []),
+    measures: new Set(saved[sheet]?.measures || [])
+  });
+
+  document.body.className = "cfg-body";
   document.body.innerHTML = `
-    <div style="font:13px sans-serif;padding:10px;display:flex;flex-direction:column;gap:10px;">
-      <label>Sheet to export
-        <select id="sheetPick">${opt("", "Auto-detect")}${names.map(n => opt(n, n)).join("")}</select>
+    <div class="cfg">
+      <label class="field">Sheet to export
+        <select id="sheetPick"></select>
       </label>
-      <label>Require a selection on (optional)
-        <select id="gatePick">${opt("", "— none —")}${names.map(n => opt(n, n)).join("")}</select>
+      <label class="field">Require a selection on (optional)
+        <select id="gatePick"></select>
       </label>
-      <div style="display:flex;gap:8px;justify-content:flex-end;">
-        <button id="cancelBtn">Cancel</button>
-        <button id="saveBtn">Save</button>
+      <section class="cols" aria-labelledby="colsTitle">
+        <div class="cols-head">
+          <strong id="colsTitle">Columns</strong>
+          <span class="count" id="colsCount"></span>
+        </div>
+        <div class="list" id="colList"></div>
+        <p class="hint">Unticked columns are left out of the export for this sheet only.
+          Fields you add to the sheet later are included automatically.</p>
+      </section>
+      <div class="actions">
+        <button class="btn quiet" id="allBtn" type="button">Include all</button>
+        <button class="btn" id="cancelBtn" type="button">Cancel</button>
+        <button class="btn primary" id="saveBtn" type="button">Save</button>
       </div>
     </div>`;
 
+  const fill = (sel, first, values) => {
+    [first, ...values.map(n => [n, n])].forEach(([v, l]) => sel.add(new Option(l, v)));
+  };
+  fill($("sheetPick"), ["", "Auto-detect"], names);
+  fill($("gatePick"),  ["", "None"], names);
   $("sheetPick").value = tableau.extensions.settings.get("sourceSheet") || "";
   $("gatePick").value  = tableau.extensions.settings.get("gateSheet")  || "";
+
+  let current = null;        // { sheet, items } currently shown
+  let loadToken = 0;         // ignores slow loads after the dropdown changed
+
+  const message = (text, isError) => {
+    const d = document.createElement("div");
+    d.className = "msg" + (isError ? " error" : "");
+    d.textContent = text;
+    return d;
+  };
+
+  function updateCount() {
+    if (!current) { $("colsCount").textContent = ""; return; }
+    const d = draftFor(current.sheet);
+    const live = current.items.filter(i => !i.locked && !i.stale);
+    const on = live.filter(i => !d[i.kind].has(i.key) && !i.noneNow).length;
+    $("colsCount").textContent = on + " of " + live.length + " exported";
+  }
+
+  function render(sheet, items, auto) {
+    const d = draftFor(sheet);
+    // Exclusions saved earlier for fields not in the view right now (filtered
+    // out, or a measure temporarily removed). Kept, and shown so they can be cleared.
+    ["columns", "measures"].forEach(kind => {
+      d[kind].forEach(key => {
+        if (!items.some(i => i.kind === kind && i.key === key)) {
+          items.push({ kind, key, label: key, detail: "not in the view right now", stale: true });
+        }
+      });
+    });
+    current = { sheet, items };
+
+    $("colsTitle").textContent = "Columns in \u201C" + sheet + "\u201D" + (auto ? " (auto-detected)" : "");
+    const list = $("colList");
+    list.replaceChildren();
+    if (!items.length) { list.append(message("This sheet has no columns to export.")); updateCount(); return; }
+
+    [["columns", "Fields"], ["measures", "Measures"]].forEach(([kind, title]) => {
+      const group = items.filter(i => i.kind === kind);
+      if (!group.length) return;
+      const h = document.createElement("div");
+      h.className = "group";
+      h.textContent = title;
+      list.append(h);
+
+      group.forEach(item => {
+        const row = document.createElement("label");
+        const box = document.createElement("input");
+        box.type = "checkbox";
+        const name = document.createElement("span");
+        name.className = "name";
+        name.textContent = item.label;
+        name.title = item.key;
+        row.append(box, name);
+        if (item.detail) {
+          const det = document.createElement("span");
+          det.className = "detail";
+          det.textContent = item.detail;
+          row.append(det);
+        }
+        const sync = () => row.className = "item" + (item.locked ? " locked" : "") + (box.checked ? "" : " off");
+        if (item.locked) {
+          box.checked = false;
+          box.disabled = true;
+        } else {
+          box.checked = !d[kind].has(item.key);
+          box.onchange = () => {
+            box.checked ? d[kind].delete(item.key) : d[kind].add(item.key);
+            sync();
+            updateCount();
+          };
+        }
+        sync();
+        list.append(row);
+      });
+    });
+    updateCount();
+  }
+
+  async function load() {
+    const token = ++loadToken;
+    current = null;
+    $("colList").replaceChildren(message("Reading columns\u2026"));
+    updateCount();
+    try {
+      const choice = $("sheetPick").value;
+      const ws = await pickWorksheet(choice);
+      if (!ws) throw new Error("No worksheet found on this dashboard.");
+      const params = await dashboard.getParametersAsync();
+      const items = await readSheetItems(ws, params);
+      if (token === loadToken) render(ws.name, items, !choice);
+    } catch (e) {
+      if (token === loadToken) {
+        $("colList").replaceChildren(message("Couldn't read this sheet's columns: " + e.message, true));
+      }
+    }
+  }
+
+  $("sheetPick").onchange = load;
+  $("allBtn").onclick = () => {
+    if (!current) return;
+    const d = draftFor(current.sheet);
+    d.columns.clear();
+    d.measures.clear();
+    render(current.sheet, current.items.filter(i => !i.stale), !$("sheetPick").value);
+  };
   $("cancelBtn").onclick = () => tableau.extensions.ui.closeDialog("");
   $("saveBtn").onclick = async () => {
-    tableau.extensions.settings.set("sourceSheet", $("sheetPick").value);
-    tableau.extensions.settings.set("gateSheet", $("gatePick").value);
-    await tableau.extensions.settings.saveAsync();
-    tableau.extensions.ui.closeDialog("saved");
+    $("saveBtn").disabled = true;
+    try {
+      const all = readExcludes();
+      Object.entries(draft).forEach(([sheet, d]) => {
+        const entry = { columns: [...d.columns], measures: [...d.measures] };
+        if (entry.columns.length || entry.measures.length) all[sheet] = entry;
+        else delete all[sheet];
+      });
+      tableau.extensions.settings.set("sourceSheet", $("sheetPick").value);
+      tableau.extensions.settings.set("gateSheet", $("gatePick").value);
+      tableau.extensions.settings.set(EXCLUDE_KEY, JSON.stringify(all));
+      await tableau.extensions.settings.saveAsync();
+      tableau.extensions.ui.closeDialog("saved");
+    } catch (e) {
+      $("saveBtn").disabled = false;
+      $("colsCount").textContent = "Save failed: " + e.message;
+    }
   };
-}     
+
+  await load();
+}
+
+// What the Configure checklist offers for one sheet: each column (with the
+// header it currently exports under) plus, when measures are pivoted, each
+// individual measure from Measure Values. Reads a single page of data.
+async function readSheetItems(ws, params) {
+  const reader = await ws.getSummaryDataReaderAsync(CONFIG_SAMPLE_ROWS);
+  let columns, rows = [];
+  try {
+    if (reader.pageCount > 0) {
+      const page = await reader.getPageAsync(0);
+      columns = page.columns;
+      rows = page.data;
+    }
+  } finally {
+    await reader.releaseAsync();
+  }
+  if (!columns) {                     // empty sheet: no page to read
+    columns = typeof ws.getSummaryColumnsInfoAsync === "function"
+      ? await ws.getSummaryColumnsInfoAsync() : [];
+  }
+
+  const map = buildHeaderMap(columns.map(c => c.fieldName), params);
+  const nameCol = columns.find(c => isMeasureNames(c.fieldName));
+  const pivoting = PIVOT_MEASURES && nameCol && columns.some(c => isMeasureValues(c.fieldName));
+  const items = [];
+
+  columns.forEach(c => {
+    const f = c.fieldName;
+    if (pivoting && (isMeasureNames(f) || isMeasureValues(f))) return;  // shown as measures below
+    if (DROP_FIELDS.includes(f)) {
+      items.push({ kind: "columns", key: f, label: f, detail: "always dropped", locked: true });
+    } else if (isSortField(f)) {
+      items.push({ kind: "columns", key: f, label: f, detail: "sort helper, always dropped", locked: true });
+    } else {
+      const hit = map[f];
+      // A level set to None isn't exported right now, but stays tickable:
+      // the choice applies again once the parameter picks an attribute.
+      const noneNow = !!hit && isNone(hit.label);
+      let detail = "";
+      if (hit) detail = noneNow ? "level set to None" : "exports as \u201C" + hit.label + "\u201D";
+      items.push({ kind: "columns", key: f, label: f, detail, noneNow });
+    }
+  });
+
+  if (pivoting) {
+    const seen = [];
+    rows.forEach(r => {
+      const m = r[nameCol.index].formattedValue;
+      if (!seen.includes(m)) seen.push(m);
+    });
+    seen.forEach(m => items.push({ kind: "measures", key: m, label: m }));
+  }
+  return items;
+}
 
 (async function init() {
   if (typeof tableau === "undefined") {
@@ -329,15 +592,18 @@ async function refresh() {
   const ws = await pickWorksheet();
   const names = await columnNamesOf(ws);
 
+  const ex = excludesFor(ws.name);
   let labels, lines;
   if (names) {
     const map = buildHeaderMap(names, params);
     const entries = names.filter(isSelectorField);
-    labels = entries.map(fn => map[fn]?.label).filter(l => l && !isNone(l));
+    labels = entries.filter(fn => !ex.columns.includes(fn))
+      .map(fn => map[fn]?.label).filter(l => l && !isNone(l));
     lines = entries.map(fn =>
       "  [" + (map[fn]?.axis || "?") + "]  " + fn +
       "\n        <- " + (map[fn] ? map[fn].param + (map[fn].exact ? "" : "  (loose match)") : "no parameter") +
-      "\n        = " + (map[fn] ? (isNone(map[fn].label) ? "(none, dropped)" : map[fn].label) : "?"));
+      "\n        = " + (map[fn] ? (isNone(map[fn].label) ? "(none, dropped)" : map[fn].label) : "?") +
+      (ex.columns.includes(fn) ? "  (excluded in Configure)" : ""));
     const sortFields = names.filter(isSortField);
     if (sortFields.length) {
       lines.push("\nSORT HELPERS (always dropped)\n" + sortFields.map(f => "  " + f).join("\n"));
@@ -355,18 +621,28 @@ async function refresh() {
     "\n\nGRID SHEET\n  " + ws.name +
     (names ? "" : "  (columns readable only at export time)") +
     "\n\nSELECTOR RESOLUTION\n" + (lines.join("\n") || "  none found — check AXES patterns") +
+    "\n\nEXCLUDED IN CONFIGURE\n" +
+      (ex.columns.length || ex.measures.length
+        ? (ex.columns.length  ? "  columns:  " + ex.columns.join(", ")  + "\n" : "") +
+          (ex.measures.length ? "  measures: " + ex.measures.join(", ") : "")
+        : "  nothing, every column exports") +
     "\n\nALL PARAMETERS\n" + params.map(p =>
       "  " + p.name + " = " + p.currentValue.formattedValue).join("\n")
   );
 }
 
 // Long -> wide: one column per Measure Names value.
-function pivotMeasures(keep, table) {
+function pivotMeasures(keep, table, excludedMeasures = []) {
   const nameCol = keep.find(k => isMeasureNames(k.field));
   const valCol  = keep.find(k => isMeasureValues(k.field));
   if (!nameCol || !valCol) return null;
 
+  // Rows are grouped on EVERY dimension, including ones excluded in Configure,
+  // and excluded ones are only removed from the output afterwards. Dropping
+  // e.g. Grid Index before grouping could make two rows share a key, and the
+  // second would silently overwrite the first one's measures.
   const dims = keep.filter(k => k !== nameCol && k !== valCol);
+  const outDims = dims.map((d, i) => ({ d, i })).filter(x => !x.d.excluded);
   const groups = new Map();      // insertion order preserves row order
   const seen = [];
   const decimalsSeen = {};       // measure -> decimal places, for Diagnostics
@@ -405,13 +681,14 @@ function pivotMeasures(keep, table) {
   const ordered = [
     ...MEASURE_ORDER.filter(m => seen.includes(m)),
     ...seen.filter(m => !MEASURE_ORDER.includes(m))
-  ];
+  ].filter(m => !excludedMeasures.includes(m));
 
   return {
-    header: [...dims.map(d => d.header), ...ordered],
+    header: [...outDims.map(x => x.d.header), ...ordered],
     rows: [...groups.values()].map(g =>
-      [...g.dimVals, ...ordered.map(m => g.measures[m] ?? null)]),
+      [...outDims.map(x => g.dimVals[x.i]), ...ordered.map(m => g.measures[m] ?? null)]),
     order: ordered,
+    droppedMeasures: seen.filter(m => excludedMeasures.includes(m)),
     decimalsSeen
   };
 }
@@ -434,6 +711,8 @@ async function run() {
 
     const params = await dashboard.getParametersAsync();
     const map = buildHeaderMap(table.columns.map(c => c.fieldName), params);
+    const ex = excludesFor(ws.name);
+    const isExcluded = f => ex.columns.includes(f) && !isMeasureNames(f) && !isMeasureValues(f);
 
     const keep = [];
     const droppedSort = [];
@@ -443,33 +722,40 @@ async function run() {
       const hit = map[c.fieldName];
       if (hit) {
         if (isNone(hit.label)) return;                       // level set to None
-        keep.push({ index: c.index, field: c.fieldName, header: hit.label });
+        keep.push({ index: c.index, field: c.fieldName, header: hit.label, excluded: isExcluded(c.fieldName) });
       } else {
-        keep.push({ index: c.index, field: c.fieldName, header: c.fieldName });
+        keep.push({ index: c.index, field: c.fieldName, header: c.fieldName, excluded: isExcluded(c.fieldName) });
       }
     });
     if (!keep.length) throw new Error("No columns left to export — check Diagnostics.");
 
     let header, rows;
-    const pivoted = PIVOT_MEASURES ? pivotMeasures(keep, table) : null;
+    const pivoted = PIVOT_MEASURES ? pivotMeasures(keep, table, ex.measures) : null;
     if (pivoted) {
       ({ header, rows } = pivoted);
     } else {
-      header = keep.map(k => k.header);
-      rows = table.data.map(r => keep.map(k => {
+      const out = keep.filter(k => !k.excluded);
+      header = out.map(k => k.header);
+      rows = table.data.map(r => out.map(k => {
         const cell = r[k.index];
         return typeof cell.nativeValue === "number" ? cell.nativeValue : cell.formattedValue;
       }));
+    }
+    if (!header.length) {
+      throw new Error("Every column is excluded for this sheet. Open Configure to include some.");
     }
 
     setDiag(diagText +
       "\n\nCOLUMNS IN \"" + ws.name + "\"\n" +
       table.columns.map(c => "  [" + c.index + "] " + c.fieldName +
         (isSortField(c.fieldName) ? "  (sort helper, dropped)" :
+         isExcluded(c.fieldName) ? "  (excluded in Configure)" :
          map[c.fieldName] ? "  ->  " + (map[c.fieldName].label || "(none)") : "")).join("\n") +
       (pivoted
         ? "\n\nMEASURES DETECTED (view order, decimal places read from Tableau)\n" +
-          pivoted.order.map(m => "  " + m + "  ->  " + pivoted.decimalsSeen[m] + " dp").join("\n")
+          pivoted.order.map(m => "  " + m + "  ->  " + pivoted.decimalsSeen[m] + " dp").join("\n") +
+          (pivoted.droppedMeasures.length
+            ? "\n  excluded in Configure: " + pivoted.droppedMeasures.join(", ") : "")
         : "") +
       "\n\nEXPORTED\n  " + header.join(" | ") +
       "\n  " + rows.length + " rows" + (pivoted ? " (measures pivoted)" : " (not pivoted)"));
